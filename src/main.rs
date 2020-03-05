@@ -3,12 +3,13 @@
 
 use async_std::sync::{channel, Receiver, Sender};
 use async_std::{stream, stream::StreamExt};
-use futures::{future::FutureExt, join, select};
+use futures::{future::FutureExt, select};
 use log::info;
 use rand::{thread_rng, Rng};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+#[derive(Clone)]
 struct LogEntry {
     cmd: String,
     term: i32,
@@ -18,8 +19,8 @@ struct LogEntry {
 struct RequestVoteArgs {
     term: i32,
     candidate_id: i32,
-    // last_log_index: i32,
-    // last_log_term: i32,
+    last_log_index: i32,
+    last_log_term: i32,
 }
 
 struct RequestVoteReply {
@@ -27,19 +28,20 @@ struct RequestVoteReply {
     vote_granted: bool,
 }
 
-#[derive(Clone)]
 struct AppendEntriesArgs {
     term: i32,
     leader_id: i32,
-    // prev_log_index: i32,
-    // prev_log_term: i32,
-    // entries: Vec<LogEntry>,
-    // leader_commit: i32,
+    prev_log_index: i32,
+    prev_log_term: i32,
+    entries: Vec<LogEntry>,
+    leader_commit: i32,
 }
 
 struct AppendEntriesReply {
     term: i32,
     success: bool,
+    peer_id: i32,    // extra
+    next_index: i32, // extra
 }
 
 enum Msg {
@@ -57,8 +59,8 @@ enum NodeRole {
 }
 
 struct LeaderState {
-    // next_index: BTreeMap<i32, i32>,
-    // match_index: BTreeMap<i32, i32>,
+    next_index: BTreeMap<i32, i32>,
+    match_index: BTreeMap<i32, i32>,
     last_heartbeat_event: Instant,
 }
 
@@ -74,10 +76,10 @@ struct Node {
     // persistent
     curr_term: i32,
     vote_for: Option<i32>, // in curr term
-    // logs: Vec<LogEntry>,
+    logs: Vec<LogEntry>,
     // all state
-    // commit_index: i32,
-    // last_applied: i32,
+    commit_index: i32,
+    last_applied: i32,
     role: NodeRole,
     election_reset_event: Instant,
     // tmp state
@@ -95,9 +97,9 @@ impl Node {
             peers: BTreeMap::new(),
             curr_term: 0,
             vote_for: None,
-            // logs: Vec::new(),
-            // commit_index: -1,
-            // last_applied: -1,
+            logs: Vec::new(),
+            commit_index: -1,
+            last_applied: -1,
             role: NodeRole::Follower,
             election_reset_event: Instant::now(),
             leader_state: None,
@@ -124,6 +126,14 @@ impl Node {
                             leader_state.last_heartbeat_event = Instant::now();
                             self.send_heartbeat().await;
                         }
+                        // random log entry nearly every 1 sec
+                        if thread_rng().gen::<u8>() <= 2 {
+                            self.logs.push(LogEntry{
+                                cmd: thread_rng().gen::<u8>().to_string(),
+                                term: self.curr_term,
+                            });
+                            info!("{} new log {}", self.id, self.logs.len() - 1);
+                        }
                     } else {
                         // if role is follower and not received heartbeat for a lone time or
                         // if role is candidate and not received major votes in this term
@@ -131,6 +141,12 @@ impl Node {
                             self.start_eletion().await;
                             election_timeout = self.get_election_timeout(); // re-random
                         }
+                    }
+                    // apply the committed log entires
+                    if self.commit_index > self.last_applied {
+                        let indices = (self.last_applied+1..self.commit_index+1).collect::<Vec<_>>();
+                        info!("{} applied logs {:?}", self.id, indices);
+                        self.last_applied = self.commit_index;
                     }
                 },
                 msg = self.receiver.recv().fuse() => {
@@ -169,16 +185,20 @@ impl Node {
             term: self.curr_term,
             vote_granted: false,
         };
+        let (last_log_index, last_log_term) = self.last_log_index_and_term();
         if args.term == self.curr_term
             && (self.vote_for.is_none() || self.vote_for == Some(args.candidate_id))
+            && (args.last_log_term > last_log_term
+                || (args.last_log_term == last_log_term && args.last_log_index >= last_log_index))
         {
             info!("{} vote for {}", self.id, args.candidate_id);
             reply.vote_granted = true;
             self.vote_for = Some(args.candidate_id);
             self.election_reset_event = Instant::now(); // postpond
         }
-        let peer_sender = self.peers.get(&args.candidate_id).unwrap();
-        peer_sender.send(Msg::RequestVoteReply(reply)).await;
+        self.peers[&args.candidate_id]
+            .send(Msg::RequestVoteReply(reply))
+            .await;
     }
 
     async fn process_append_entries_request(&mut self, args: AppendEntriesArgs) {
@@ -186,8 +206,10 @@ impl Node {
             self.become_follower(args.term);
         }
         let mut reply = AppendEntriesReply {
+            peer_id: self.id,
             term: self.curr_term,
             success: false,
+            next_index: 0,
         };
         if args.term == self.curr_term {
             if self.role == NodeRole::Candidate {
@@ -195,20 +217,101 @@ impl Node {
                 self.become_follower(args.term);
             }
             self.election_reset_event = Instant::now();
-            reply.success = true;
+
+            if args.prev_log_index == -1
+                || (args.prev_log_index < self.logs.len() as i32
+                    && args.prev_log_term == self.logs[args.prev_log_index as usize].term)
+            {
+                // prev log matched
+                reply.success = true;
+                reply.next_index = args.prev_log_index + args.entries.len() as i32 + 1;
+                // find the mismatch point
+                let mut log_insert_index = (args.prev_log_index + 1) as usize;
+                let mut new_entries_index = 0;
+                loop {
+                    if log_insert_index >= self.logs.len()
+                        || new_entries_index >= args.entries.len()
+                    {
+                        break;
+                    }
+                    if self.logs[log_insert_index].term != args.entries[new_entries_index].term {
+                        break;
+                    }
+                    log_insert_index += 1;
+                    new_entries_index += 1;
+                }
+                // drop self.logs[log_insert_index..]
+                let _ = self.logs.drain(log_insert_index..);
+                // add args.entries[new_entries_index..]
+                let new_entries = &args.entries[new_entries_index..];
+                self.logs.extend_from_slice(new_entries);
+                if !new_entries.is_empty() {
+                    let new_indices = (log_insert_index..self.logs.len()).collect::<Vec<_>>();
+                    info!("{} accept logs {:?}", self.id, new_indices);
+                }
+                // set commit index
+                if args.leader_commit > self.commit_index {
+                    let old_commit_index = self.commit_index;
+                    self.commit_index = args.leader_commit.min(self.logs.len() as i32 - 1);
+                    info!(
+                        "{} commit logs {:?}",
+                        self.id,
+                        (old_commit_index + 1..self.commit_index + 1).collect::<Vec<_>>()
+                    );
+                }
+            }
         }
-        let peer_sender = self.peers.get(&args.leader_id).unwrap();
-        peer_sender.send(Msg::AppendEntriesReply(reply)).await;
+        self.peers[&args.leader_id]
+            .send(Msg::AppendEntriesReply(reply))
+            .await;
     }
 
     fn process_append_entries_reply(&mut self, reply: AppendEntriesReply) {
         if reply.term > self.curr_term {
             self.become_follower(reply.term);
         }
+        if self.role == NodeRole::Leader {
+            let leader_state = self.leader_state.as_mut().unwrap();
+            let peer_next_index = leader_state.next_index.get_mut(&reply.peer_id).unwrap();
+            let peer_match_index = leader_state.match_index.get_mut(&reply.peer_id).unwrap();
+            if !reply.success {
+                // if pre log index not matched, decrease index by 1
+                *peer_next_index -= 1;
+            } else {
+                *peer_next_index = reply.next_index;
+                *peer_match_index = reply.next_index - 1;
+                for i in self.commit_index + 1..*peer_match_index + 1 {
+                    if self.logs[i as usize].term == self.curr_term {
+                        let match_cnt = 1 + self
+                            .peers
+                            .keys()
+                            .filter(|peer_id| leader_state.match_index[peer_id] >= i)
+                            .count();
+                        // if replicated by a majority then commit it
+                        if match_cnt * 2 > self.peers.len() + 1 {
+                            self.commit_index = i;
+                            info!("{} commit log {} ({} replicates)", self.id, i, match_cnt);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn get_election_timeout(&self) -> Duration {
         Duration::from_millis(thread_rng().gen_range(150, 300))
+    }
+
+    fn last_log_index_and_term(&self) -> (i32, i32) {
+        let last_log_index = self.logs.len() as i32 - 1;
+        let last_log_term = if last_log_index >= 0 {
+            self.logs[last_log_index as usize].term
+        } else {
+            -1
+        };
+        (last_log_index, last_log_term)
     }
 
     async fn start_eletion(&mut self) {
@@ -223,10 +326,13 @@ impl Node {
             "{} become Candidate and start election at term {}",
             self.id, self.curr_term
         );
+        let (last_log_index, last_log_term) = self.last_log_index_and_term();
         // request vote to all peers
         let args = RequestVoteArgs {
             term: self.curr_term,
             candidate_id: self.id,
+            last_log_index,
+            last_log_term,
         };
         for peer_sender in self.peers.values() {
             peer_sender.send(Msg::RequestVoteArgs(args.clone())).await;
@@ -257,9 +363,12 @@ impl Node {
     async fn become_leader(&mut self) {
         self.role = NodeRole::Leader;
         // self.election_state = None;
+        let next_log_index = self.logs.len() as i32;
+        let next_index = self.peers.keys().map(|&id| (id, next_log_index)).collect();
+        let match_index = self.peers.keys().map(|&id| (id, -1)).collect();
         self.leader_state = Some(LeaderState {
-            // next_index: BTreeMap::new(),
-            // match_index: BTreeMap::new(),
+            next_index,
+            match_index,
             last_heartbeat_event: Instant::now(),
         });
         self.send_heartbeat().await;
@@ -279,27 +388,42 @@ impl Node {
     }
 
     async fn send_heartbeat(&self) {
-        let args = AppendEntriesArgs {
-            term: self.curr_term,
-            leader_id: self.id,
-        };
-        for peer_sender in self.peers.values() {
-            peer_sender.send(Msg::AppendEntriesArgs(args.clone())).await;
+        let leader_state = self.leader_state.as_ref().unwrap();
+        for (peer_id, peer_sender) in &self.peers {
+            let i = leader_state.next_index[peer_id];
+            let prev_log_index = i - 1;
+            let prev_log_term = if prev_log_index >= 0 {
+                self.logs[prev_log_index as usize].term
+            } else {
+                -1
+            };
+            let args = AppendEntriesArgs {
+                term: self.curr_term,
+                leader_id: self.id,
+                prev_log_index,
+                prev_log_term,
+                entries: self.logs[i as usize..].to_vec(),
+                leader_commit: self.commit_index,
+            };
+            peer_sender.send(Msg::AppendEntriesArgs(args)).await;
         }
     }
 }
 
 async fn test() {
-    let mut node1 = Node::new(1);
-    let mut node2 = Node::new(2);
-    let mut node3 = Node::new(3);
-    node1.add_peer(&node2);
-    node1.add_peer(&node3);
-    node2.add_peer(&node1);
-    node2.add_peer(&node3);
-    node3.add_peer(&node1);
-    node3.add_peer(&node2);
-    join!(node1.run(), node2.run(), node3.run());
+    use core::cell::RefCell;
+    use futures::stream::futures_unordered::FuturesUnordered;
+    let nodes: Vec<RefCell<Node>> = (0..5).map(|i| RefCell::new(Node::new(i))).collect();
+    for i in 0..5 {
+        for j in 0..5 {
+            if i != j {
+                nodes[i].borrow_mut().add_peer(&nodes[j].borrow());
+            }
+        }
+    }
+    let mut nodes: Vec<Node> = nodes.into_iter().map(|node| node.into_inner()).collect();
+    let futs: FuturesUnordered<_> = nodes.iter_mut().map(|node| node.run()).collect();
+    futs.collect::<Vec<_>>().await;
 }
 
 fn main() {
